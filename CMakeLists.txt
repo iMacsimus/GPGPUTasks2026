@@ -121,7 +121,7 @@ add_executable(main_matrix_multiply  src/main_02_matrix_multiply.cpp)
 
 target_link_libraries(main_aplusb           ${PROJECT_NAME}_core)
 target_link_libraries(main_matrix_transpose ${PROJECT_NAME}_core)
-target_link_libraries(main_matrix_multiply  ${PROJECT_NAME}_core)
+target_link_libraries(main_matrix_multiply  ${PROJECT_NAME}_core CUDA::cublas)
 
 if (GPU_CUDA_SUPPORT)
     target_include_directories(main_aplusb           PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
