@@ -7,6 +7,8 @@
 #include "helpers/rassert.cu"
 #include "../defines.h"
 
+#include <cublas_v2.h>
+
 #define HD __host__ __device__
 
 struct float2x2 {
@@ -77,7 +79,41 @@ void matrix_multiply_via_local_memory(const gpu::WorkSize &workSize,
     gpu::Context context;
     rassert(context.type() == gpu::Context::TypeCUDA, 34523543124312, context.type());
     cudaStream_t stream = context.cudaStream();
-    ::matrix_multiply_via_local_memory<<<workSize.cuGridSize(), workSize.cuBlockSize(), 0, stream>>>((float2*)a.cuptr(), (float2*)b.cuptr(), (float2*)c.cuptr(), w, h, k);
+
+    // Создаём handle cuBLAS (можно сделать статическим, чтобы не создавать каждый раз)
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    cublasSetStream(handle, stream);
+
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+
+    // ВАЖНО: cuBLAS Column-Major.
+    // Мы хотим C = A * B (Row-Major).
+    // Это эквивалентно C^T = B^T * A^T (Column-Major).
+    // Поэтому:
+    //   - "m" и "n" в cuBLAS — это размеры C^T.
+    //   - C (h x w) => C^T (w x h) => m = w, n = h.
+    //   - "k" — общая размерность (глубина) = k.
+    //   - "A" в cuBLAS — это B (k x w Row-Major) => в Column-Major это (w x k).
+    //   - "B" в cuBLAS — это A (h x k Row-Major) => в Column-Major это (k x h).
+    
+    // Аргументы cublasSgemm:
+    // cublasSgemm(handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
+    
+    cublasSgemm(handle,
+                CUBLAS_OP_N,  // Не транспонируем "B" (в нашем случае это матрица A)
+                CUBLAS_OP_N,  // Не транспонируем "A" (в нашем случае это матрица B)
+                w,            // m: строки в C^T (столбцы в C, т.е. w)
+                h,            // n: столбцы в C^T (строки в C, т.е. h)
+                k,            // k: глубина
+                &alpha,
+                (const float*)b.cuptr(), w,  // "A" = B (k x w), lda = w (ширина B в Row-Major)
+                (const float*)a.cuptr(), k,  // "B" = A (h x k), ldb = k (ширина A в Row-Major)
+                &beta,
+                (float*)c.cuptr(), w);       // "C" = C (h x w), ldc = w (ширина C в Row-Major)
+
+    cublasDestroy(handle); // Если handle не статический
     CUDA_CHECK_KERNEL(stream);
 }
 } // namespace cuda
