@@ -7,6 +7,9 @@
 
 #define MATMUL_DIM 16
 
+#define X_TILES 4
+#define K_TILES 4
+
 #define RASSERT_ENABLED 0 // disabled by default, enable for debug by changing 0 to 1, disable before performance evaluation/profiling/commiting
 
 #endif // pragma once

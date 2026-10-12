@@ -74,38 +74,54 @@ __global__ void matrix_multiply_wmma(
                        unsigned int h,
                        unsigned int k)
 {
-    __shared__ half local_a[8][16][16];
-    __shared__ half local_b[8][16][16];
+    __shared__ half local_a[8][K_TILES][256];
+    __shared__ half local_b[K_TILES][X_TILES][256];
 
-    uint32_t wi = threadIdx.y / 2;
+    const uint32_t wi = threadIdx.y;
+    const uint32_t tid = threadIdx.y * 32 + threadIdx.x;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[8];
-    for (int j = 0; j < 8; ++j) {
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[X_TILES];
+    for (int j = 0; j < X_TILES; ++j) {
       wmma::fill_fragment(c_frag[j], 0.0f);
     }
 
-    const unsigned int k_tiles = (k + 15) / 16;
-    const unsigned int w_tiles = (w + 15) / 16;
-    for (int i = 0; i < k/16; ++i) {
+    const unsigned int k_tiles_count = (k + 15) / 16;
+    const unsigned int w_tiles_count = (w + 15) / 16;
+
+    const half2* a2 = reinterpret_cast<const half2*>(a_compressed);
+    const half2* b2 = reinterpret_cast<const half2*>(b_compressed);
+    half2* local_a2 = reinterpret_cast<half2*>(&local_a[0][0][0]);
+    half2* local_b2 = reinterpret_cast<half2*>(&local_b[0][0][0]);
+
+    const unsigned int a_row_half2 = K_TILES * 128;
+    const unsigned int b_row_half2 = X_TILES * 128;
+
+    for (int i = 0; i < k_tiles_count / K_TILES; ++i) {
       __syncthreads();
-      for (int j = 0; j < 8; ++j) {
-        local_a[j][threadIdx.y][threadIdx.x] = a_compressed[((blockIdx.y * 8 + j) * k_tiles + i) * 256 + threadIdx.y * 16 + threadIdx.x];
+      for (unsigned int idx = tid; idx < 8 * a_row_half2; idx += 256) {
+        const unsigned int r = idx / a_row_half2;
+        const unsigned int off = idx % a_row_half2;
+        local_a2[idx] = a2[((blockIdx.y * 8 + r) * k_tiles_count + i * K_TILES) * 128 + off];
       }
-      for (int j = 0; j < 8; ++j) {
-        local_b[j][threadIdx.y][threadIdx.x] = b_compressed[(i * w_tiles + (blockIdx.x * 8 + j)) * 256 + threadIdx.y * 16 + threadIdx.x];
+      for (unsigned int idx = tid; idx < K_TILES * b_row_half2; idx += 256) {
+        const unsigned int t = idx / b_row_half2;
+        const unsigned int off = idx % b_row_half2;
+        local_b2[idx] = b2[((i * K_TILES + t) * w_tiles_count + blockIdx.x * X_TILES) * 128 + off];
       }
       __syncthreads();
-      for (int j = 0; j < 8; ++j) {
-        wmma::load_matrix_sync(a_frag, (half*)local_a[wi], 16);
-        wmma::load_matrix_sync(b_frag, (half*)local_b[j], 16);
-        wmma::mma_sync(c_frag[j], a_frag, b_frag, c_frag[j]);
+      for (int t = 0; t < K_TILES; ++t) {
+        wmma::load_matrix_sync(a_frag, local_a[wi][t], 16);
+        for (int j = 0; j < X_TILES; ++j) {
+          wmma::load_matrix_sync(b_frag, local_b[t][j], 16);
+          wmma::mma_sync(c_frag[j], a_frag, b_frag, c_frag[j]);
+        }
       }
     }
 
-    uint32_t warpOffsetX = blockIdx.x * 128;
+    uint32_t warpOffsetX = blockIdx.x * (X_TILES * 16);
     uint32_t warpOffsetY = blockIdx.y * (128) + wi * 16;
-    for (int j = 0; j < 8; ++j) {
+    for (int j = 0; j < X_TILES; ++j) {
       wmma::store_matrix_sync(c + (warpOffsetY*w + warpOffsetX + j*16), c_frag[j], w, wmma::mem_row_major);
     }
 }
