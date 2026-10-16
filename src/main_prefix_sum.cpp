@@ -103,17 +103,17 @@ void run(int argc, char** argv)
             uint32_t offset = 0;
             timer reduceTime;
             while (insz > 1) {
-              gpu::WorkSize ws(256, insz);
+              gpu::WorkSize ws(REDUCTION_FACTOR, insz);
               const uint32_t *in = (offset == 0) ? input_gpu.cuptr() : (buffer_pow2_sum_gpu.cuptr() + offset - insz);
               uint32_t *out = buffer_pow2_sum_gpu.cuptr() + offset;
               cuda::prefix_sum_01_reduction(ws, in, out, insz);
-              offset += (insz + 255) / 256;
-              insz = (insz + 255) / 256;
+              offset += (insz + REDUCTION_FACTOR - 1) / REDUCTION_FACTOR;
+              insz = (insz + REDUCTION_FACTOR - 1) / REDUCTION_FACTOR;
             }
             // std::cout << "reduce time: " << reduceTime.elapsed() << std::endl;
 
             timer accumTime;
-            gpu::WorkSize ws(256, n);
+            gpu::WorkSize ws(REDUCTION_FACTOR, n);
             cuda::prefix_sum_02_prefix_accumulation(
                 ws, input_gpu, buffer_pow2_sum_gpu, prefix_sum_accum_gpu, n);
             // std::cout << "accum time: " << accumTime.elapsed() << std::endl;

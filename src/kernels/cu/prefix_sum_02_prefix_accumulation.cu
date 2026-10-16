@@ -30,7 +30,7 @@ __global__ void prefix_sum_02_prefix_accumulation(
   uint32_t local_idx = threadIdx.x;
   uint32_t warp_idx = local_idx / 32;
   
-  __shared__ uint32_t warp_sum[GROUP_SIZE/32];
+  __shared__ uint32_t warp_sum[REDUCTION_FACTOR/32];
   __shared__ uint32_t wgsum;
   uint32_t res = 0;
 
@@ -50,18 +50,18 @@ __global__ void prefix_sum_02_prefix_accumulation(
 
   uint32_t offset = 0;
   uint32_t count = blockIdx.x;
-  uint32_t pow_count = (n+255) / 256;
+  uint32_t pow_count = (n + REDUCTION_FACTOR - 1) / REDUCTION_FACTOR;
 
   uint32_t sum = 0;
   while(count > 0) {
-    uint32_t mod = count % 256;
+    uint32_t mod = count % REDUCTION_FACTOR;
 
     uint32_t my_value = local_idx < mod ? pow2_sum[offset + (count - mod) + local_idx] : 0;
     sum += my_value;
 
     offset += pow_count;
-    pow_count = (pow_count + 255) / 256;
-    count /= 256;
+    pow_count = (pow_count + REDUCTION_FACTOR - 1) / REDUCTION_FACTOR;
+    count /= REDUCTION_FACTOR;
   }
 
   __syncthreads();
