@@ -17,8 +17,8 @@
 
 #include <libbase/point.h>
 
-#include <thrust/sort.h>
-#include <thrust/system/cuda/execution_policy.h>
+#include <cub/device/device_radix_sort.cuh>
+#include <cfloat>
 
 #include <algorithm>
 #include <cmath>
@@ -30,8 +30,6 @@ namespace {
 
 // Per-triangle info
 struct Prim {
-  uint32_t triIndex;
-  uint32_t morton;
   AABBGPU aabb;
   float3 centroid;
 };
@@ -176,8 +174,53 @@ __device__ float atomicMaxFloat(float *address, float value) {
   return __uint_as_float(old);
 }
 
+__device__ void reduceWarpBounds(float3 &lower, float3 &upper) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    lower.x = fminf(lower.x, __shfl_down_sync(0xFFFFFFFFu, lower.x, offset));
+    lower.y = fminf(lower.y, __shfl_down_sync(0xFFFFFFFFu, lower.y, offset));
+    lower.z = fminf(lower.z, __shfl_down_sync(0xFFFFFFFFu, lower.z, offset));
+    upper.x = fmaxf(upper.x, __shfl_down_sync(0xFFFFFFFFu, upper.x, offset));
+    upper.y = fmaxf(upper.y, __shfl_down_sync(0xFFFFFFFFu, upper.y, offset));
+    upper.z = fmaxf(upper.z, __shfl_down_sync(0xFFFFFFFFu, upper.z, offset));
+  }
+}
+
+__device__ void reduceCentroidBounds(float3 lower, float3 upper,
+                                     float3 *globalLower, float3 *globalUpper) {
+  static_assert(GROUP_SIZE % 32 == 0 && GROUP_SIZE <= 1024);
+  __shared__ float3 warpLower[GROUP_SIZE / 32];
+  __shared__ float3 warpUpper[GROUP_SIZE / 32];
+  const int lane = threadIdx.x % 32;
+  const int warp = threadIdx.x / 32;
+
+  reduceWarpBounds(lower, upper);
+  if (lane == 0) {
+    warpLower[warp] = lower;
+    warpUpper[warp] = upper;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    lower = lane < GROUP_SIZE / 32 ? warpLower[lane]
+                                  : make_float3(FLT_MAX, FLT_MAX, FLT_MAX);
+    upper = lane < GROUP_SIZE / 32 ? warpUpper[lane]
+                                  : make_float3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    reduceWarpBounds(lower, upper);
+    if (lane == 0) {
+      atomicMinFloat(&globalLower->x, lower.x);
+      atomicMinFloat(&globalLower->y, lower.y);
+      atomicMinFloat(&globalLower->z, lower.z);
+      atomicMaxFloat(&globalUpper->x, upper.x);
+      atomicMaxFloat(&globalUpper->y, upper.y);
+      atomicMaxFloat(&globalUpper->z, upper.z);
+    }
+  }
+}
+
 __global__ void computePrims(const uint32_t *faces, const float *vertices, Prim *prims, float3 *cMin, float3 *cMax, int N) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
+  float3 lower = make_float3(FLT_MAX, FLT_MAX, FLT_MAX);
+  float3 upper = make_float3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
   if (i < N) {
     uint3 f = loadFace(faces, i);
     float3 v0 = loadVertex(vertices, f.x);
@@ -197,20 +240,16 @@ __global__ void computePrims(const uint32_t *faces, const float *vertices, Prim 
     c.y = (v0.y + v1.y + v2.y) * (1.0f / 3.0f);
     c.z = (v0.z + v1.z + v2.z) * (1.0f / 3.0f);
 
-    prims[i].triIndex = static_cast<uint32_t>(i);
     prims[i].aabb = aabb;
     prims[i].centroid = c;
 
-    atomicMinFloat(&cMin->x, c.x);
-    atomicMinFloat(&cMin->y, c.y);
-    atomicMinFloat(&cMin->z, c.z);
-    atomicMaxFloat(&cMax->x, c.x);
-    atomicMaxFloat(&cMax->y, c.y);
-    atomicMaxFloat(&cMax->z, c.z);
+    lower = c;
+    upper = c;
   }
+  reduceCentroidBounds(lower, upper, cMin, cMax);
 }
 
-__global__ void computeMortonCodes(Prim *prims, const float3 *cMin, const float3 *cMax, int N) {
+__global__ void computeMortonCodes(const Prim *prims, const float3 *cMin, const float3 *cMax, uint32_t *codes, uint32_t *indices, int N) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= N) return;
 
@@ -229,17 +268,11 @@ __global__ void computeMortonCodes(Prim *prims, const float3 *cMin, const float3
   ny = min(max(ny, 0.0f), 1.0f);
   nz = min(max(nz, 0.0f), 1.0f);
 
-  prims[i].morton = morton3D(nx, ny, nz);
+  codes[i] = morton3D(nx, ny, nz);
+  indices[i] = static_cast<uint32_t>(i);
 }
 
-__global__ void prepareArrays(const Prim *prims, uint32_t* sortedCodes, uint32_t* outLeafTriIndices, int N) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= N) return;
-  sortedCodes[i] = prims[i].morton;
-  outLeafTriIndices[i] = prims[i].triIndex;
-}
-
-__global__ void buildBVHNodes(const Prim *prims, const uint32_t *sortedCodes, BVHNodeGPU *outNodes, uint32_t *parents, int N) {
+__global__ void buildBVHNodes(const Prim *prims, const uint32_t *sortedCodes, const uint32_t *sortedIndices, BVHNodeGPU *outNodes, uint32_t *parents, int N) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= 2*N-1) return;
 
@@ -247,7 +280,7 @@ __global__ void buildBVHNodes(const Prim *prims, const uint32_t *sortedCodes, BV
     size_t leafIndex = i;
     BVHNodeGPU &leaf = outNodes[leafIndex];
 
-    leaf.aabb = prims[i-(N-1)].aabb;
+    leaf.aabb = prims[sortedIndices[i - (N - 1)]].aabb;
     leaf.leftChildIndex = -1u;
     leaf.rightChildIndex = -1u;
   } else {
@@ -322,13 +355,18 @@ struct LBVHBuilderScratchData {
   gpu::shared_device_buffer_typed<float3> cMin;
   gpu::shared_device_buffer_typed<float3> cMax;
   gpu::shared_device_buffer_typed<uint32_t> sortedCodes;
+  gpu::shared_device_buffer_typed<uint32_t> mortonCodes;
+  gpu::shared_device_buffer_typed<uint32_t> triangleIndices;
+  gpu::gpu_mem_any sortWorkspace;
   gpu::shared_device_buffer_typed<uint32_t> parents;
   gpu::shared_device_buffer_typed<uint32_t> visitCounters;
 };
 
 LBVHBuilderScratchData::LBVHBuilderScratchData(int N) {
-  prims.resize(N * sizeof(Prim));
+  prims.resize(static_cast<size_t>(N) * sizeof(Prim));
   sortedCodes.resizeN(N);
+  mortonCodes.resizeN(N);
+  triangleIndices.resizeN(N);
   cMin.resizeN(1);
   cMax.resizeN(1);
   parents.resizeN(2 * N - 1);
@@ -348,14 +386,14 @@ void buildLBVH_GPU(const gpu::gpu_mem_32f &vertices,
   rassert(context.type() == gpu::Context::TypeCUDA, 34523543124312, context.type());
   cudaStream_t stream = context.cudaStream();
 
-  auto &[prims, cMin, cMax, sortedCodes, parents, visitCounters] = scratchData;
+  auto &[prims, cMin, cMax, sortedCodes, mortonCodes, triangleIndices, sortWorkspace, parents, visitCounters] = scratchData;
 
-  cMin.fill({+std::numeric_limits<float>::infinity(),
-               +std::numeric_limits<float>::infinity(),
-               +std::numeric_limits<float>::infinity()});
-  cMax.fill({-std::numeric_limits<float>::infinity(),
-              -std::numeric_limits<float>::infinity(),
-              -std::numeric_limits<float>::infinity()});
+  cMin.fill({+std::numeric_limits<float>::max(),
+               +std::numeric_limits<float>::max(),
+               +std::numeric_limits<float>::max()});
+  cMax.fill({-std::numeric_limits<float>::max(),
+              -std::numeric_limits<float>::max(),
+              -std::numeric_limits<float>::max()});
   cudaMemsetAsync(visitCounters.cuptr(), 0, (2*N-1)*sizeof(uint32_t), stream);
 
   gpu::WorkSize wsN(GROUP_SIZE, N);
@@ -366,25 +404,26 @@ void buildLBVH_GPU(const gpu::gpu_mem_32f &vertices,
       faces.cuptr(), vertices.cuptr(), (Prim*)prims.cuptr(), cMin.cuptr(),
       cMax.cuptr(), N);
 
-  //2) Compute Morton codes for centroids (normalized to [0,1]^3)
   ::computeMortonCodes<<<wsN.cuGridSize(), wsN.cuBlockSize(), 0, stream>>>(
-      (Prim*)prims.cuptr(), cMin.cuptr(), cMax.cuptr(), N);
+      (Prim*)prims.cuptr(), cMin.cuptr(), cMax.cuptr(),
+      mortonCodes.cuptr(), triangleIndices.cuptr(), N);
 
-  // 3) Sort primitives by Morton code
-  thrust::stable_sort(thrust::cuda::par.on(stream), (Prim*)prims.cuptr(),
-                      (Prim*)prims.cuptr() + N,
-                      [] __device__(const Prim &a, const Prim &b) {
-                        return a.morton < b.morton;
-                      });
-
-  // // 4) Prepare arrays
-  ::prepareArrays<<<wsN.cuGridSize(), wsN.cuBlockSize(), 0, stream>>>(
-      (Prim*)prims.cuptr(), sortedCodes.cuptr(), outLeafTriIndices.cuptr(), N);
+  size_t workspaceBytes = 0;
+  CUDA_SAFE_CALL(cub::DeviceRadixSort::SortPairs(
+      nullptr, workspaceBytes, mortonCodes.cuptr(), sortedCodes.cuptr(),
+      triangleIndices.cuptr(), outLeafTriIndices.cuptr(), N, 0, 30, stream));
+  if (sortWorkspace.size() < workspaceBytes) {
+    sortWorkspace.resize(workspaceBytes);
+  }
+  CUDA_SAFE_CALL(cub::DeviceRadixSort::SortPairs(
+      sortWorkspace.cuptr(), workspaceBytes, mortonCodes.cuptr(), sortedCodes.cuptr(),
+      triangleIndices.cuptr(), outLeafTriIndices.cuptr(), N, 0, 30, stream));
 
   // // 5) Initialize leaf nodes [N-1 .. 2*N-2]
   // // 6) Build internal nodes [0 .. N-2]
   ::buildBVHNodes<<<ws2N.cuGridSize(), ws2N.cuBlockSize(), 0, stream>>>(
-      (Prim*)prims.cuptr(), sortedCodes.cuptr(), outNodes.cuptr(), parents.cuptr(), N);
+      (Prim*)prims.cuptr(), sortedCodes.cuptr(), outLeafTriIndices.cuptr(),
+      outNodes.cuptr(), parents.cuptr(), N);
 
   // // 7.1) Enumerating bottom-up traversal order for internal nodes to build AABB
   // // 7.2) AABB propagation for internal nodes in the bottom-up traversal order

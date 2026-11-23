@@ -33,6 +33,9 @@ struct LBVHBuilderScratchData {
   gpu::shared_device_buffer_typed<float3> cMin;
   gpu::shared_device_buffer_typed<float3> cMax;
   gpu::shared_device_buffer_typed<uint32_t> sortedCodes;
+  gpu::shared_device_buffer_typed<uint32_t> mortonCodes;
+  gpu::shared_device_buffer_typed<uint32_t> triangleIndices;
+  gpu::gpu_mem_any sortWorkspace;
   gpu::shared_device_buffer_typed<uint32_t> parents;
   gpu::shared_device_buffer_typed<uint32_t> visitCounters;
 };
